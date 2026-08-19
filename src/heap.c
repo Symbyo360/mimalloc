@@ -24,17 +24,18 @@ terms of the MIT license. A copy of the license can be found in the file
 typedef bool (heap_page_visitor_fun)(mi_heap_t* heap, mi_page_queue_t* pq, mi_page_t* page, void* arg1, void* arg2);
 
 // Visit all pages in a heap; returns `false` if break was called.
-static bool mi_heap_visit_pages(mi_heap_t* heap, heap_page_visitor_fun* fn, void* arg1, void* arg2)
+static bool mi_heap_visit_pages(mi_heap_t* heap, heap_page_visitor_fun* fn, bool include_full, void* arg1, void* arg2)
 {
-  if (heap==NULL || heap->page_count==0) return 0;
+  if (heap==NULL || heap->page_count==0) return true;
 
   // visit all pages
   #if MI_DEBUG>1
   size_t total = heap->page_count;
   size_t count = 0;
-  #endif  
+  #endif
 
-  for (size_t i = 0; i <= MI_BIN_FULL; i++) {
+  const size_t max_bin = (include_full ? MI_BIN_FULL : MI_BIN_FULL - 1);
+  for (size_t i = 0; i <= max_bin; i++) {
     mi_page_queue_t* pq = &heap->pages[i];
     mi_page_t* page = pq->first;
     while(page != NULL) {
@@ -47,7 +48,7 @@ static bool mi_heap_visit_pages(mi_heap_t* heap, heap_page_visitor_fun* fn, void
       page = next; // and continue
     }
   }
-  mi_assert_internal(count == total);
+  mi_assert_internal(!include_full || count == total);
   return true;
 }
 
@@ -59,7 +60,7 @@ static bool mi_heap_page_is_valid(mi_heap_t* heap, mi_page_queue_t* pq, mi_page_
   MI_UNUSED(pq);
   mi_assert_internal(mi_page_heap(page) == heap);
   mi_segment_t* segment = _mi_page_segment(page);
-  mi_assert_internal(segment->thread_id == heap->thread_id);
+  mi_assert_internal(mi_atomic_load_relaxed(&segment->thread_id) == heap->thread_id);
   mi_assert_expensive(_mi_page_is_valid(page));
   return true;
 }
@@ -67,7 +68,7 @@ static bool mi_heap_page_is_valid(mi_heap_t* heap, mi_page_queue_t* pq, mi_page_
 #if MI_DEBUG>=3
 static bool mi_heap_is_valid(mi_heap_t* heap) {
   mi_assert_internal(heap!=NULL);
-  mi_heap_visit_pages(heap, &mi_heap_page_is_valid, NULL, NULL);
+  mi_heap_visit_pages(heap, &mi_heap_page_is_valid, true, NULL, NULL);
   return true;
 }
 #endif
@@ -143,18 +144,22 @@ static void mi_heap_collect_ex(mi_heap_t* heap, mi_collect_t collect)
 
   // if abandoning, mark all pages to no longer add to delayed_free
   if (collect == MI_ABANDON) {
-    mi_heap_visit_pages(heap, &mi_heap_page_never_delayed_free, NULL, NULL);
+    mi_heap_visit_pages(heap, &mi_heap_page_never_delayed_free, true, NULL, NULL);
   }
 
   // free all current thread delayed blocks.
   // (if abandoning, after this there are no more thread-delayed references into the pages.)
-  _mi_heap_delayed_free_all(heap);
+  if (collect >= MI_ABANDON) {
+    _mi_heap_delayed_free_all(heap);      // free all
+  } else {
+    _mi_heap_delayed_free_partial(heap);  // best-effort; contended blocks are retried next time
+  }
 
   // collect retired pages
   _mi_heap_collect_retired(heap, force);
 
   // collect all pages owned by this thread
-  mi_heap_visit_pages(heap, &mi_heap_page_collect, &collect, NULL);
+  mi_heap_visit_pages(heap, &mi_heap_page_collect, (collect!=MI_NORMAL), &collect, NULL); // normally don't visit full pages, issue #1220
   mi_assert_internal( collect != MI_ABANDON || mi_atomic_load_ptr_acquire(mi_block_t,&heap->thread_delayed_free) == NULL );
 
   // collect segments (purge pages, this can be expensive so don't force on abandonment)
@@ -164,9 +169,12 @@ static void mi_heap_collect_ex(mi_heap_t* heap, mi_collect_t collect)
   if (force && is_main_thread && mi_heap_is_backing(heap)) {
     _mi_thread_data_collect();  // collect thread data cache
   }
-  
+
   // collect arenas (this is program wide so don't force purges on abandonment of threads)
-  _mi_arenas_collect(collect == MI_FORCE /* force purge? */, &heap->tld->stats);  
+  _mi_arenas_collect(collect == MI_FORCE /* force purge? */);
+
+  // merge statistics
+  if (collect <= MI_FORCE) { _mi_stats_merge_thread(heap->tld); }
 }
 
 void _mi_heap_collect_abandon(mi_heap_t* heap) {
@@ -213,7 +221,11 @@ void _mi_heap_init(mi_heap_t* heap, mi_tld_t* tld, mi_arena_id_t arena_id, bool 
   heap->no_reclaim = noreclaim;
   heap->tag        = tag;
   if (heap == tld->heap_backing) {
-    _mi_random_init(&heap->random);
+    #if defined(_WIN32) && !defined(MI_SHARED_LIB)
+      _mi_random_init_weak(&heap->random);    // prevent allocation failure during bcrypt dll initialization with static linking (issue #1185)
+    #else
+      _mi_random_init(&heap->random);
+    #endif
   }
   else {
     _mi_random_split(&tld->heap_backing->random, &heap->random);
@@ -221,6 +233,7 @@ void _mi_heap_init(mi_heap_t* heap, mi_tld_t* tld, mi_arena_id_t arena_id, bool 
   heap->cookie  = _mi_heap_random_next(heap) | 1;
   heap->keys[0] = _mi_heap_random_next(heap);
   heap->keys[1] = _mi_heap_random_next(heap);
+  _mi_heap_guarded_init(heap);
   // push on the thread local heaps list
   heap->next = heap->tld->heaps;
   heap->tld->heaps = heap;
@@ -240,7 +253,7 @@ mi_decl_nodiscard mi_heap_t* mi_heap_new_in_arena(mi_arena_id_t arena_id) {
 }
 
 mi_decl_nodiscard mi_heap_t* mi_heap_new(void) {
-  // don't reclaim abandoned memory or otherwise destroy is unsafe  
+  // don't reclaim abandoned memory or otherwise destroy is unsafe
   return mi_heap_new_ex(0 /* default heap tag */, true /* no reclaim */, _mi_arena_id_none());
 }
 
@@ -323,19 +336,19 @@ static bool _mi_heap_page_destroy(mi_heap_t* heap, mi_page_queue_t* pq, mi_page_
   // stats
   const size_t bsize = mi_page_block_size(page);
   if (bsize > MI_LARGE_OBJ_SIZE_MAX) {
-    mi_heap_stat_decrease(heap, huge, bsize);
+    mi_heap_stat_decrease(heap, malloc_huge, bsize);
   }
-#if (MI_STAT)
+  #if (MI_STAT>0)
   _mi_page_free_collect(page, false);  // update used count
   const size_t inuse = page->used;
   if (bsize <= MI_LARGE_OBJ_SIZE_MAX) {
-    mi_heap_stat_decrease(heap, normal, bsize * inuse);
-#if (MI_STAT>1)
-    mi_heap_stat_decrease(heap, normal_bins[_mi_bin(bsize)], inuse);
-#endif
+    mi_heap_stat_decrease(heap, malloc_normal, bsize * inuse);
+    #if (MI_STAT>1)
+    mi_heap_stat_decrease(heap, malloc_bins[_mi_bin(bsize)], inuse);
+    #endif
   }
-  mi_heap_stat_decrease(heap, malloc, bsize * inuse);  // todo: off for aligned blocks...
-#endif
+  // mi_heap_stat_decrease(heap, malloc_requested, bsize * inuse);  // todo: off for aligned blocks...
+  #endif
 
   /// pretend it is all free now
   mi_assert_internal(mi_page_thread_free(page) == NULL);
@@ -351,7 +364,7 @@ static bool _mi_heap_page_destroy(mi_heap_t* heap, mi_page_queue_t* pq, mi_page_
 }
 
 void _mi_heap_destroy_pages(mi_heap_t* heap) {
-  mi_heap_visit_pages(heap, &_mi_heap_page_destroy, NULL, NULL);
+  mi_heap_visit_pages(heap, &_mi_heap_page_destroy, true, NULL, NULL);
   mi_heap_reset_pages(heap);
 }
 
@@ -369,7 +382,13 @@ void mi_heap_destroy(mi_heap_t* heap) {
   mi_assert(heap->no_reclaim);
   mi_assert_expensive(mi_heap_is_valid(heap));
   if (heap==NULL || !mi_heap_is_initialized(heap)) return;
+  #if MI_GUARDED
+  // _mi_warning_message("'mi_heap_destroy' called but MI_GUARDED is enabled -- using `mi_heap_delete` instead (heap at %p)\n", heap);
+  mi_heap_delete(heap);
+  return;
+  #else
   if (!heap->no_reclaim) {
+    _mi_warning_message("'mi_heap_destroy' called but ignored as the heap was not created with 'allow_destroy' (heap at %p)\n", heap);
     // don't free in case it may contain reclaimed pages
     mi_heap_delete(heap);
   }
@@ -382,12 +401,14 @@ void mi_heap_destroy(mi_heap_t* heap) {
     _mi_heap_destroy_pages(heap);
     mi_heap_free(heap);
   }
+  #endif
 }
 
 // forcefully destroy all heaps in the current thread
-void _mi_heap_unsafe_destroy_all(void) {
-  mi_heap_t* bheap = mi_heap_get_backing();
-  mi_heap_t* curr = bheap->tld->heaps;
+void _mi_heap_unsafe_destroy_all(mi_heap_t* heap) {
+  mi_assert_internal(heap != NULL);
+  if (heap == NULL) return;
+  mi_heap_t* curr = heap->tld->heaps;
   while (curr != NULL) {
     mi_heap_t* next = curr->next;
     if (curr->no_reclaim) {
@@ -438,6 +459,12 @@ static void mi_heap_absorb(mi_heap_t* heap, mi_heap_t* from) {
   mi_heap_reset_pages(from);
 }
 
+// are two heaps compatible with respect to heap-tag, exclusive arena etc.
+static bool mi_heaps_are_compatible(mi_heap_t* heap1, mi_heap_t* heap2) {
+  return (heap1->tag == heap2->tag &&                   // store same kind of objects
+          heap1->arena_id == heap2->arena_id);          // same arena preference
+}
+
 // Safe delete a heap without freeing any still allocated blocks in that heap.
 void mi_heap_delete(mi_heap_t* heap)
 {
@@ -446,9 +473,10 @@ void mi_heap_delete(mi_heap_t* heap)
   mi_assert_expensive(mi_heap_is_valid(heap));
   if (heap==NULL || !mi_heap_is_initialized(heap)) return;
 
-  if (!mi_heap_is_backing(heap)) {
+  mi_heap_t* bheap = heap->tld->heap_backing;
+  if (bheap != heap && mi_heaps_are_compatible(bheap,heap)) {
     // transfer still used pages to the backing heap
-    mi_heap_absorb(heap->tld->heap_backing, heap);
+    mi_heap_absorb(bheap, heap);
   }
   else {
     // the backing heap abandons its pages
@@ -507,7 +535,7 @@ bool mi_heap_check_owned(mi_heap_t* heap, const void* p) {
   if (heap==NULL || !mi_heap_is_initialized(heap)) return false;
   if (((uintptr_t)p & (MI_INTPTR_SIZE - 1)) != 0) return false;  // only aligned pointers
   bool found = false;
-  mi_heap_visit_pages(heap, &mi_heap_page_check_owned, (void*)p, &found);
+  mi_heap_visit_pages(heap, &mi_heap_page_check_owned, true, (void*)p, &found);
   return found;
 }
 
@@ -536,13 +564,14 @@ void _mi_heap_area_init(mi_heap_area_t* area, mi_page_t* page) {
 
 static void mi_get_fast_divisor(size_t divisor, uint64_t* magic, size_t* shift) {
   mi_assert_internal(divisor > 0 && divisor <= UINT32_MAX);
-  *shift = 64 - mi_clz(divisor - 1);
-  *magic = ((((uint64_t)1 << 32) * (((uint64_t)1 << *shift) - divisor)) / divisor + 1);  
+  *shift = MI_SIZE_BITS - mi_clz(divisor - 1);
+  *magic = ((((uint64_t)1 << 32) * (((uint64_t)1 << *shift) - divisor)) / divisor + 1);
 }
 
 static size_t mi_fast_divide(size_t n, uint64_t magic, size_t shift) {
   mi_assert_internal(n <= UINT32_MAX);
-  return ((((uint64_t)n * magic) >> 32) + n) >> shift;
+  const uint64_t hi = ((uint64_t)n * magic) >> 32;
+  return (size_t)((hi + n) >> shift);
 }
 
 bool _mi_heap_area_visit_blocks(const mi_heap_area_t* area, mi_page_t* page, mi_block_visit_fun* visitor, void* arg) {
@@ -551,7 +580,8 @@ bool _mi_heap_area_visit_blocks(const mi_heap_area_t* area, mi_page_t* page, mi_
   mi_assert(page != NULL);
   if (page == NULL) return true;
 
-  _mi_page_free_collect(page,true);              // collect both thread_delayed and local_free
+  // collect early so the page used count is reported correctly
+  // _mi_page_free_collect(page,true);              // collect both thread_delayed and local_free
   mi_assert_internal(page->local_free == NULL);
   if (page->used == 0) return true;
 
@@ -581,7 +611,7 @@ bool _mi_heap_area_visit_blocks(const mi_heap_area_t* area, mi_page_t* page, mi_
   // create a bitmap of free blocks.
   #define MI_MAX_BLOCKS   (MI_SMALL_PAGE_SIZE / sizeof(void*))
   uintptr_t free_map[MI_MAX_BLOCKS / MI_INTPTR_BITS];
-  const uintptr_t bmapsize = _mi_divide_up(page->capacity, MI_INTPTR_BITS);    
+  const uintptr_t bmapsize = _mi_divide_up(page->capacity, MI_INTPTR_BITS);
   memset(free_map, 0, bmapsize * sizeof(intptr_t));
   if (page->capacity % MI_INTPTR_BITS != 0) {
     // mark left-over bits at the end as free
@@ -591,7 +621,7 @@ bool _mi_heap_area_visit_blocks(const mi_heap_area_t* area, mi_page_t* page, mi_
   }
 
   // fast repeated division by the block size
-  uint64_t magic; 
+  uint64_t magic;
   size_t   shift;
   mi_get_fast_divisor(bsize, &magic, &shift);
 
@@ -662,17 +692,19 @@ typedef bool (mi_heap_area_visit_fun)(const mi_heap_t* heap, const mi_heap_area_
 static bool mi_heap_visit_areas_page(mi_heap_t* heap, mi_page_queue_t* pq, mi_page_t* page, void* vfun, void* arg) {
   MI_UNUSED(heap);
   MI_UNUSED(pq);
+  if (page==NULL) return true;
   mi_heap_area_visit_fun* fun = (mi_heap_area_visit_fun*)vfun;
   mi_heap_area_ex_t xarea;
-  xarea.page = page;
-  _mi_heap_area_init(&xarea.area, page);  
+  xarea.page = page;  
+  _mi_page_free_collect(page,true); // collect early so the page->used is accurate  
+  _mi_heap_area_init(&xarea.area, page);
   return fun(heap, &xarea, arg);
 }
 
 // Visit all heap pages as areas
 static bool mi_heap_visit_areas(const mi_heap_t* heap, mi_heap_area_visit_fun* visitor, void* arg) {
   if (visitor == NULL) return false;
-  return mi_heap_visit_pages((mi_heap_t*)heap, &mi_heap_visit_areas_page, (void*)(visitor), arg); // note: function pointer to void* :-{
+  return mi_heap_visit_pages((mi_heap_t*)heap, &mi_heap_visit_areas_page, true, (void*)(visitor), arg); // note: function pointer to void* :-{
 }
 
 // Just to pass arguments
@@ -697,4 +729,38 @@ static bool mi_heap_area_visitor(const mi_heap_t* heap, const mi_heap_area_ex_t*
 bool mi_heap_visit_blocks(const mi_heap_t* heap, bool visit_blocks, mi_block_visit_fun* visitor, void* arg) {
   mi_visit_blocks_args_t args = { visit_blocks, visitor, arg };
   return mi_heap_visit_areas(heap, &mi_heap_area_visitor, &args);
+}
+
+
+
+static const mi_page_t* mi_safe_ptr_page(void* p) {
+  const mi_segment_t* const segment = _mi_ptr_segment(p);
+  if mi_unlikely(segment==NULL) return NULL;
+  #ifndef NDEBUG
+  if mi_unlikely(!mi_is_in_heap_region(p)) return NULL;
+  #endif
+  if mi_unlikely(_mi_ptr_cookie(segment) != segment->cookie) return NULL;
+  return _mi_segment_page_of(segment, p);
+}
+
+// unsafe heap utilization function for DragonFly (see issue #1258)
+// If the page of pointer `p` belongs to `heap` (or `heap==NULL`) and has less than `perc_threshold` used blocks in its used area return `true`.
+// This function is unsafe in general as it assumes we are the only thread accessing the page of `p`.
+bool mi_unsafe_heap_page_is_under_utilized(mi_heap_t* heap, void* p, size_t perc_threshold) mi_attr_noexcept {
+  if (p==NULL) return false;
+  const mi_page_t* const page = mi_safe_ptr_page(p);   // Get the page containing this pointer
+  if (page==NULL || page->used==page->capacity || page->capacity < page->reserved) return false;
+  // If the page is the head of the queue, it is currently being used for 
+  // allocations; we skip it to avoid immediate thrashing.
+  if (page->prev == NULL)  return false;
+
+  // match heap?
+  const mi_heap_t* const page_heap = mi_page_heap(page);
+  if (page_heap==NULL) return false;
+  if (heap!=NULL && page_heap!=heap) return false;
+    
+  // check utilization
+  if (page->capacity==0)   return false;
+  if (perc_threshold>=100) return true;
+  return (perc_threshold >= ((100UL*page->used) / page->capacity));
 }

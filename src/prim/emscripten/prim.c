@@ -1,5 +1,5 @@
 /* ----------------------------------------------------------------------------
-Copyright (c) 2018-2023, Microsoft Research, Daan Leijen, Alon Zakai
+Copyright (c) 2018-2025, Microsoft Research, Daan Leijen, Alon Zakai
 This is free software; you can redistribute it and/or modify it under the
 terms of the MIT license. A copy of the license can be found in the file
 "LICENSE" at the root of this distribution.
@@ -11,6 +11,8 @@ terms of the MIT license. A copy of the license can be found in the file
 #include "mimalloc/internal.h"
 #include "mimalloc/atomic.h"
 #include "mimalloc/prim.h"
+
+#include <unistd.h>  // getentropy
 
 // Design
 // ======
@@ -58,7 +60,6 @@ void _mi_prim_mem_init( mi_os_mem_config_t* config) {
 extern void emmalloc_free(void*);
 
 int _mi_prim_free(void* addr, size_t size) {
-  MI_UNUSED(size);
   emmalloc_free(addr);
   return 0;
 }
@@ -71,8 +72,8 @@ int _mi_prim_free(void* addr, size_t size) {
 extern void* emmalloc_memalign(size_t alignment, size_t size);
 
 // Note: the `try_alignment` is just a hint and the returned pointer is not guaranteed to be aligned.
-int _mi_prim_alloc(size_t size, size_t try_alignment, bool commit, bool allow_large, bool* is_large, bool* is_zero, void** addr) {
-  MI_UNUSED(try_alignment); MI_UNUSED(allow_large); MI_UNUSED(commit);
+int _mi_prim_alloc(void* hint_addr, size_t size, size_t try_alignment, bool commit, bool allow_large, bool* is_large, bool* is_zero, void** addr) {
+  MI_UNUSED(try_alignment); MI_UNUSED(allow_large); MI_UNUSED(commit); MI_UNUSED(hint_addr);
   *is_large = false;
   // TODO: Track the highest address ever seen; first uses of it are zeroes.
   //       That assumes no one else uses sbrk but us (they could go up,
@@ -114,6 +115,11 @@ int _mi_prim_reset(void* addr, size_t size) {
   return 0;
 }
 
+int _mi_prim_reuse(void* addr, size_t size) {
+  MI_UNUSED(addr); MI_UNUSED(size);
+  return 0;
+}
+
 int _mi_prim_protect(void* addr, size_t size, bool protect) {
   MI_UNUSED(addr); MI_UNUSED(size); MI_UNUSED(protect);
   return 0;
@@ -147,7 +153,8 @@ size_t _mi_prim_numa_node_count(void) {
 #include <emscripten/html5.h>
 
 mi_msecs_t _mi_prim_clock_now(void) {
-  return emscripten_date_now();
+  // todo: use a monotonic clock instead
+  return emscripten_date_now();  
 }
 
 
@@ -177,12 +184,12 @@ void _mi_prim_out_stderr( const char* msg) {
 // Environment
 //----------------------------------------------------------------
 
-bool _mi_prim_getenv(const char* name, char* result, size_t result_size) {
+int _mi_prim_getenv(const char* name, char* result, size_t result_size) {
   // For code size reasons, do not support environ customization for now.
   MI_UNUSED(name);
   MI_UNUSED(result);
   MI_UNUSED(result_size);
-  return false;
+  return 0; // not found
 }
 
 
@@ -218,7 +225,9 @@ void _mi_prim_thread_init_auto_done(void) {
 }
 
 void _mi_prim_thread_done_auto_done(void) {
-  // nothing to do
+  if (_mi_heap_default_key != (pthread_key_t)(-1)) {  // do not leak the key, see issue #809
+    pthread_key_delete(_mi_heap_default_key);
+  }
 }
 
 void _mi_prim_thread_associate_default_heap(mi_heap_t* heap) {

@@ -89,7 +89,7 @@ static void* mi_prim_mem_grow(size_t size, size_t try_alignment) {
     {
       void* current = mi_memory_grow(0);  // get current size
       if (current != NULL) {
-        void* aligned_current = mi_align_up_ptr(current, try_alignment);  // and align from there to minimize wasted space
+        void* aligned_current = _mi_align_up_ptr(current, try_alignment);  // and align from there to minimize wasted space
         alloc_size = _mi_align_up( ((uint8_t*)aligned_current - (uint8_t*)current) + size, _mi_os_page_size());
         base = mi_memory_grow(alloc_size);
       }
@@ -98,7 +98,7 @@ static void* mi_prim_mem_grow(size_t size, size_t try_alignment) {
     pthread_mutex_unlock(&mi_heap_grow_mutex);
     #endif
     if (base != NULL) {
-      p = mi_align_up_ptr(base, try_alignment);
+      p = _mi_align_up_ptr(base, try_alignment);
       if ((uint8_t*)p + size > (uint8_t*)base + alloc_size) {
         // another thread used wasm_memory_grow/sbrk in-between and we do not have enough
         // space after alignment. Give up (and waste the space as we cannot shrink :-( )
@@ -119,8 +119,8 @@ static void* mi_prim_mem_grow(size_t size, size_t try_alignment) {
 }
 
 // Note: the `try_alignment` is just a hint and the returned pointer is not guaranteed to be aligned.
-int _mi_prim_alloc(size_t size, size_t try_alignment, bool commit, bool allow_large, bool* is_large, bool* is_zero, void** addr) {
-  MI_UNUSED(allow_large); MI_UNUSED(commit);
+int _mi_prim_alloc(void* hint_addr, size_t size, size_t try_alignment, bool commit, bool allow_large, bool* is_large, bool* is_zero, void** addr) {
+  MI_UNUSED(allow_large); MI_UNUSED(commit); MI_UNUSED(hint_addr);
   *is_large = false;
   *is_zero = false;
   *addr = mi_prim_mem_grow(size, try_alignment);
@@ -145,6 +145,11 @@ int _mi_prim_decommit(void* addr, size_t size, bool* needs_recommit) {
 }
 
 int _mi_prim_reset(void* addr, size_t size) {
+  MI_UNUSED(addr); MI_UNUSED(size);
+  return 0;
+}
+
+int _mi_prim_reuse(void* addr, size_t size) {
   MI_UNUSED(addr); MI_UNUSED(size);
   return 0;
 }
@@ -181,32 +186,38 @@ size_t _mi_prim_numa_node_count(void) {
 
 #include <time.h>
 
-#if defined(CLOCK_REALTIME) || defined(CLOCK_MONOTONIC)
-
-mi_msecs_t _mi_prim_clock_now(void) {
-  struct timespec t;
-  #ifdef CLOCK_MONOTONIC
-  clock_gettime(CLOCK_MONOTONIC, &t);
-  #else
-  clock_gettime(CLOCK_REALTIME, &t);
-  #endif
-  return ((mi_msecs_t)t.tv_sec * 1000) + ((mi_msecs_t)t.tv_nsec / 1000000);
-}
-
-#else
-
 // low resolution timer
-mi_msecs_t _mi_prim_clock_now(void) {
-  #if !defined(CLOCKS_PER_SEC) || (CLOCKS_PER_SEC == 1000) || (CLOCKS_PER_SEC == 0)
-  return (mi_msecs_t)clock();
-  #elif (CLOCKS_PER_SEC < 1000)
-  return (mi_msecs_t)clock() * (1000 / (mi_msecs_t)CLOCKS_PER_SEC);
+static mi_msecs_t mi_prim_clock_now_lowres(void) {
+  const int64_t ticks = (int64_t)clock();
+  #if !defined(CLOCKS_PER_SEC) 
+    return ticks;
   #else
-  return (mi_msecs_t)clock() / ((mi_msecs_t)CLOCKS_PER_SEC / 1000);
+    if (CLOCKS_PER_SEC <= 0 || CLOCKS_PER_SEC == 1000) {
+      return ticks;
+    }
+    else if (CLOCKS_PER_SEC > 0 && CLOCKS_PER_SEC < 1000) {
+      return ticks * (1000 / (mi_msecs_t)CLOCKS_PER_SEC);
+    }
+    else {
+      return ticks / ((mi_msecs_t)CLOCKS_PER_SEC / 1000);
+    }
   #endif
 }
 
-#endif
+mi_msecs_t _mi_prim_clock_now(void) {
+  #if defined(CLOCK_REALTIME) || defined(CLOCK_MONOTONIC)
+    #ifdef CLOCK_MONOTONIC
+    const clockid_t clockid = CLOCK_MONOTONIC;
+    #else
+    const clockid_t clockid = CLOCK_REALTIME;
+    #endif
+    struct timespec t;  
+    if (clock_gettime(clockid,&t) == 0) {
+      return ((mi_msecs_t)t.tv_sec * 1000) + ((mi_msecs_t)t.tv_nsec / 1000000L);
+    }
+  #endif  
+  return mi_prim_clock_now_lowres();  
+}
 
 
 //----------------------------------------------------------------
@@ -233,9 +244,9 @@ void _mi_prim_out_stderr( const char* msg ) {
 // Environment
 //----------------------------------------------------------------
 
-bool _mi_prim_getenv(const char* name, char* result, size_t result_size) {
+int _mi_prim_getenv(const char* name, char* result, size_t result_size) {
   // cannot call getenv() when still initializing the C runtime.
-  if (_mi_preloading()) return false;
+  if (_mi_preloading()) return -1;  // error, try again later
   const char* s = getenv(name);
   if (s == NULL) {
     // we check the upper case name too.
@@ -247,9 +258,9 @@ bool _mi_prim_getenv(const char* name, char* result, size_t result_size) {
     buf[len] = 0;
     s = getenv(buf);
   }
-  if (s == NULL || _mi_strnlen(s,result_size) >= result_size)  return false;
+  if (s == NULL || _mi_strnlen(s,result_size) >= result_size)  return 0; // not found
   _mi_strlcpy(result, s, result_size);
-  return true;
+  return 1; // found
 }
 
 
